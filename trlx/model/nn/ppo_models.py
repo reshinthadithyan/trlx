@@ -12,7 +12,21 @@ from transformers import (  # isort:skip
     AutoModelForCausalLM,
     PretrainedConfig,
     PreTrainedModel,
+    AutoModelForSeq2SeqLM,
 )
+
+
+@dataclass
+class Seq2SeqLMOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_last_hidden_state: Optional[torch.FloatTensor] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -48,8 +62,9 @@ class GPTHeadWithValueModel(nn.Module):
             self.n_embd = self.gpt.config.hidden_size
         else:
             self.n_embd = self.gpt.config.n_embd
-
         self.v_head = make_head(self.n_embd, 1)
+
+        
 
     def generate(self, input_ids, **x):
         return self.gpt.generate(input_ids, **x)
@@ -98,6 +113,97 @@ class GPTHeadWithValueModel(nn.Module):
             value=value,
         )
 
+
+class Seq2SeqHeadWithValueModel(nn.Module):
+    """
+    The Seq2SeqHeadWithValueModel class implements a Seq2Seq-type language model with a secondary, scalar head.
+    """
+    def __init__(self, config: Union[PretrainedConfig, str]):
+        super().__init__()
+        if isinstance(config, PretrainedConfig):
+            self.model = AutoModelForSeq2SeqLM.from_config(config)
+        else:
+            self.model = AutoModelForSeq2SeqLM.from_config(config)
+        
+        self.n_embd = self.model.config.d_model #Decoder Size            
+        
+    def generate(self, input_ids, **x):
+        return self.model.generate(input_ids, **x)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        decoder_head_mask: Optional[torch.FloatTensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None
+        ):
+            loss = None
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            hidden_states = encoder_outputs[0]
+            if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+            # get decoder inputs from shifting lm labels to the right
+                decoder_input_ids = self._shift_right(labels)
+            
+            decoder_outputs = self.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=decoder_attention_mask,
+                inputs_embeds=decoder_inputs_embeds,
+                past_key_values=past_key_values,
+                encoder_hidden_states=hidden_states,
+                encoder_attention_mask=attention_mask,
+                head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            sequence_output = decoder_outputs[0]
+            lm_logits = self.lm_head(sequence_output)
+            value = self.v_head(hidden_states).squeeze(-1)
+            if not return_dict:
+                outputs = (lm_logits,) + decoder_outputs[1:] + (value,)
+                return outputs
+            
+            return Seq2SeqLMOutput(
+                loss=loss,
+                logits=lm_logits,
+                past_key_values=decoder_outputs.past_key_values,
+                decoder_hidden_states=decoder_outputs.hidden_states,
+                decoder_attentions=decoder_outputs.attentions,
+                cross_attentions=decoder_outputs.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+                encoder_hidden_states=encoder_outputs.hidden_states,
+                encoder_attentions=encoder_outputs.attentions,
+            )
+
+
+
+
+            
+
+    
 
 class ModelBranch(PreTrainedModel):
     """
