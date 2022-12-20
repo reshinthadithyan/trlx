@@ -138,7 +138,7 @@ def hf_get_seq2seq_encoder_hidden_layers(model: nn.Module) -> Tuple[nn.Module]:
     """Returns the hidden layers of the specified model.
     """
     hidden_layers_attrs = (
-        "model.encoder.layer",
+        "encoder.block",
     )
     return findattr(model, hidden_layers_attrs)
 
@@ -146,7 +146,7 @@ def hf_get_seq2seq_decoder_hidden_layers(model: nn.Module) -> Tuple[nn.Module]:
     """Returns the hidden layers of the specified model.
     """
     hidden_layers_attrs = (
-        "model.decoder.layer",
+        "decoder.block",
     )
     return findattr(model, hidden_layers_attrs)
 
