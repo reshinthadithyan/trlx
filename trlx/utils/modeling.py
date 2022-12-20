@@ -83,6 +83,19 @@ def hf_get_causal_base_model(model: transformers.AutoModelForCausalLM) -> nn.Mod
     decoder_attrs = ("transformer", "model.decoder", "gpt_neox")
     return findattr(model, decoder_attrs)
 
+def hf_get_seq2seq_base_encoder_model(model: transformers.AutoModelForSeq2SeqLM) -> nn.Module:
+    """
+    Returns the encoder backbone of the specified HuggingFace transformers model.
+    """
+    encoder_attrs = ("model.encoder")
+    return findattr(model, encoder_attrs)
+
+def hf_get_seq2seq_base_decoder_model(model: transformers.AutoModelForSeq2SeqLM) -> nn.Module:
+    """
+    Returns the decoder backbone of the specified HuggingFace transformers model.
+    """
+    decoder_attrs = ("model.decoder")
+    return findattr(model, decoder_attrs)
 
 def hf_get_causal_final_norm(model: nn.Module) -> float:
     """Returns the final (layer) norm of the specified model.
@@ -95,6 +108,14 @@ def hf_get_causal_final_norm(model: nn.Module) -> float:
         "transformer.ln_f",
         "model.decoder.final_layer_norm",
         "gpt_neox.final_layer_norm",
+    )
+    return findattr(model, norm_attrs)
+
+def hf_get_seq2seq_final_norm(model: nn.Module) -> float:
+    """Returns the final (layer) norm of the specified model.
+    """
+    norm_attrs = (
+        "model.decoder.final_layer_norm",
     )
     return findattr(model, norm_attrs)
 
@@ -113,6 +134,21 @@ def hf_get_causal_hidden_layers(model: nn.Module) -> Tuple[nn.Module]:
     )
     return findattr(model, hidden_layers_attrs)
 
+def hf_get_seq2seq_encoder_hidden_layers(model: nn.Module) -> Tuple[nn.Module]:
+    """Returns the hidden layers of the specified model.
+    """
+    hidden_layers_attrs = (
+        "model.encoder.layer",
+    )
+    return findattr(model, hidden_layers_attrs)
+
+def hf_get_seq2seq_decoder_hidden_layers(model: nn.Module) -> Tuple[nn.Module]:
+    """Returns the hidden layers of the specified model.
+    """
+    hidden_layers_attrs = (
+        "model.decoder.layer",
+    )
+    return findattr(model, hidden_layers_attrs)
 
 def hf_get_lm_head(model: transformers.AutoModelForCausalLM) -> nn.Module:
     """Returns the language modeling (lm) head of the specified HuggingFace

@@ -11,13 +11,19 @@ from torchtyping import TensorType
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.bloom import modeling_bloom
 from transformers.models.opt import modeling_opt
+from transformers.models.t5 import modeling_t5
 
 from trlx.data.method_configs import MethodConfig, register_method
 from trlx.utils.modeling import (
     flatten_dict,
     hf_get_causal_base_model,
+    hf_get_seq2seq_base_encoder_model,
+    hf_get_seq2seq_base_decoder_model,
     hf_get_causal_final_norm,
+    hf_get_seq2seq_final_norm,
     hf_get_causal_hidden_layers,
+    hf_get_seq2seq_encoder_hidden_layers,
+    hf_get_seq2seq_decoder_hidden_layers,
     hf_get_hidden_size,
     hf_get_lm_head,
     hf_get_num_hidden_layers,
@@ -210,7 +216,17 @@ class PPOConfig(MethodConfig):
 
 
 # PPO Layers
-
+@dataclass
+class Seq2SeqLMOutputWithCrossAttentions(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_last_hidden_state: Optional[torch.FloatTensor] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 @dataclass
 class CausalLMOutputWithCrossAttentions(ModelOutput):
@@ -221,6 +237,10 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
     value: Optional[torch.FloatTensor] = None
+
+
+
+
 
 
 class CausalLMWithValueHead(nn.Module):
@@ -990,6 +1010,305 @@ class BloomModelBranch(transformers.PreTrainedModel):
         )
 
 
+class Seq2SeqHeadWithValueModel(nn.Module):
+    """
+    The Seq2SeqHeadWithValueModel class implements a Seq2Seq-type language model with a secondary, scalar head.
+    """
+    def __init__(self, config: Union[transformers.PretrainedConfig, str]):
+        super().__init__()
+        if isinstance(config, str):
+            self.config = transformers.AutoConfig.from_pretrained(config)
+        else:
+            self.config = config
+        self.base_model = transformers.AutoModelForSeq2SeqLM.from_config(self.config)
+        self.n_embd = self.base_model.config.d_model #Decoder Size       
+        self.v_head = make_head(hf_get_hidden_size(self.config), 1)
+        #args
+        self.base_model_encoder_args = inspect.getfullargspec(
+            self.base_model.encoder.forward
+        ).args
+        self.base_model_decoder_args = inspect.getfullargspec(
+            self.base_model.decoder.forward
+        ).args
+        self.lm_head = self.base_model.lm_head
+
+        
+    def generate(self, input_ids, **kwargs):
+        return self.base_model.generate(input_ids, **kwargs)
+
+    def _get_compatible_forward_kwargs(self, **kwargs) -> Dict[str, Any]:
+        """Filter out arguments not supported by the specific instance of `base_model.transformer.forward`"""
+        return {
+            k: v for k, v in kwargs.items() if k in self.base_model_transformer_args
+        }
+
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        decoder_head_mask: Optional[torch.FloatTensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None
+        ):
+            loss = None
+            use_cache = use_cache if use_cache is not None else self.config.use_cache
+            encoder_outputs = self.base_model.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            hidden_states = encoder_outputs[0]
+            if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+            # get decoder inputs from shifting lm labels to the right
+                decoder_input_ids = self.base_model._shift_right(labels)
+            
+            decoder_outputs = self.base_model.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=decoder_attention_mask,
+                inputs_embeds=decoder_inputs_embeds,
+                past_key_values=past_key_values,
+                encoder_hidden_states=hidden_states,
+                encoder_attention_mask=attention_mask,
+                head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            sequence_output = decoder_outputs[0]
+            lm_logits = self.lm_head(sequence_output)
+            value = self.v_head(hidden_states).squeeze(-1)
+            if not return_dict:
+                outputs = (lm_logits,) + decoder_outputs[1:] + (value,)
+                return outputs
+            
+            return Seq2SeqLMOutputWithCrossAttentions(
+                loss=loss,
+                logits=lm_logits,
+                past_key_values=decoder_outputs.past_key_values,
+                decoder_hidden_states=decoder_outputs.hidden_states,
+                decoder_attentions=decoder_outputs.attentions,
+                cross_attentions=decoder_outputs.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+                encoder_hidden_states=encoder_outputs.hidden_states,
+                encoder_attentions=encoder_outputs.attentions,
+            )
+
+
+class Seq2SeqLMHydraWithValueHead(nn.Module):
+    """
+    
+    """
+    def __init__(
+        self,
+        config: Union[transformers.PretrainedConfig, str],
+        num_layers_unfrozen: int = -1
+                ):
+        super().__init__()
+        if isinstance(config, str):
+            config = transformers.AutoConfig.from_pretrained(config)
+            self.config = config
+        else:
+            self.config = config
+        self.base_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(config)
+        #TODO(Add Model T5Branch)
+        #Replace Encoder with T5Branch
+        #Replace Decoder with T5Branch
+        #Replace LM Head
+        self.v_head = make_head(hf_get_hidden_size(self.config))
+        
+        self.num_layers_unfrozen = num_layers_unfrozen
+        if self.num_layers_unfrozen > 0:
+            transformers_encoder_blocks = list(hf_get_seq2seq_encoder_hidden_layers(self.base_model))
+            transformers_decoder_blocks = list(hf_get_seq2seq_decoder_hidden_layers(self.base_model))
+            #TODO: Add Frozen Head
+            branch_class = hf_get_seq2seq_lm_branch_class(self.config)
+            self.frozen_head = branch_class(
+                self.config,
+                transformers_encoder_blocks,
+                transformers_encoder_blocks,
+                #transformer_blocks[-self.num_layers_unfrozen:],
+                final_norm = hf_get_seq2seq_final_norm(self.base_model),
+                lm_head =  self.base_model.lm_head
+            )
+        self.base_model_transformer_args = inspect.getfullargspec(
+            self.base_model.transformer.forward
+        ).args
+    def _get_compatible_forward_kwargs(self, **kwargs) -> Dict[str, Any]:
+        """Filter out arguments not supported by the specific instance of `base_model.transformer.forward`"""
+        return {
+            k: v for k, v in kwargs.items() if k in self.base_model_transformer_args
+        }
+    def generate(self, input_ids, **kwargs):
+        return self.base_model.generate(input_ids, **kwargs)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        decoder_head_mask: Optional[torch.FloatTensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None
+        ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutputWithCrossAttentions]:
+        loss = None
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        encoder_outputs = self.base_model.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = encoder_outputs[0]
+        if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+        # get decoder inputs from shifting lm labels to the right
+            decoder_input_ids = self.base_model._shift_right(labels)
+        
+        decoder_outputs = self.base_model.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=past_key_values,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = decoder_outputs[0]
+        lm_logits = self.lm_head(sequence_output)
+        value = self.v_head(hidden_states).squeeze(-1)
+        if not return_dict:
+            outputs = (lm_logits,) + decoder_outputs[1:] + (value,)
+            return outputs
+        
+        return Seq2SeqLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=decoder_outputs.past_key_values,
+                decoder_hidden_states=decoder_outputs.hidden_states,
+                decoder_attentions=decoder_outputs.attentions,
+                cross_attentions=decoder_outputs.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+                encoder_hidden_states=encoder_outputs.hidden_states,
+                encoder_attentions=encoder_outputs.attentions,
+            )
+    def forward_hydra(self,input_ids,**kwargs):
+        forward_kwargs = self._get_compatible_forward_kwargs(**forward_kwargs)
+        if forward_kwargs.get("return_dict") is not None:
+            return_dict = forward_kwargs["return_dict"]
+        else:
+            return_dict = True
+        forward_kwargs["return_dict"] = True
+        forward_kwargs["output_hidden_states"] = True
+        output = self.forward(input_ids, **forward_kwargs)
+        encoder_hidden_states = output.encoder_hidden_states
+        decoder_hidden_states = output.decoder_hidden_states
+        all_hidden_states = encoder_hidden_states + decoder_hidden_states
+        input_hidden_state = all_hidden_states[-(self.num_layers_unfrozen + 1)]
+        output_shape = all_hidden_states[-1].size()
+        outputs = self.frozen_head(input_hidden_state, output_shape, **forward_kwargs)
+        if not return_dict:
+            return outputs.logits
+        return outputs
+
+
+
+
+
+      
+
+
+class T5ModelBranch(transformers.PreTrainedModel):
+    """
+    T5ModelBranch implements the frozen upper trunk of the reference model
+    used when computing the PPO KL-divergence penalty. Expects a list of
+    frozen transformer blocks and an lm_head from the base model.
+    """
+    def __init__(
+        self,
+        config: transformers.PretrainedConfig,
+        transformer_encoder_blocks: nn.ModuleList,
+        transformer_decoder_blocks: nn.ModuleList,
+        final_norm: nn.Module,
+        lm_head: nn.Module,
+    ):
+        super().__init__(config)
+
+
+        self.hidden_size = hf_get_hidden_size(config)
+        self.transformer_blocks = deepcopy(nn.ModuleList(transformer_blocks))
+        self.final_norm = deepcopy(final_norm)
+        self.lm_head = deepcopy(lm_head)
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+        self.gradient_checkpointing = False
+
+        for block in self.transformer_blocks:
+            for parameter in block.parameters():
+                parameter.requires_grad = False
+        for parameter in lm_head.parameters():
+            parameter.requires_grad = False
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_hidden_states: bool = False,
+
+    ):
+        #TODO: add support for encoder and decoder.
+        pass
+
+
+def hf_get_seq2seq_lm_branch_class(
+    config: transformers.PretrainedConfig,
+)-> "ModelBranch":
+    """Returns the Seq2SeqLM branch class for the given config."""
+    t5_branch_supported_archs = ["T5ForConditionalGeneration"]
+    arch = config.architectures[0]
+    if arch in t5_branch_supported_archs:
+        return T5ModelBranch
+    else:
+        raise ValueError(f"Unsupported architecture: {arch}")
+
 def hf_get_causal_lm_branch_class(
     config: transformers.PretrainedConfig,
 ) -> "ModelBranch":
@@ -1022,3 +1341,10 @@ def hf_get_causal_lm_branch_class(
             f"Unsupported architecture: `{arch}`. The following architectures are "
             "available for model branching:\n{all_supported_archs}"
         )
+
+if __name__ == "__main__":
+    rl_model = Seq2SeqHeadWithValueModel("t5-small")
+    dummy_input_ids = torch.randint(0, 100, (1, 10))
+    dummy_labels = torch.randint(0, 100, (1, 10))
+    output = rl_model(dummy_input_ids, labels=dummy_labels)
+    #model = T5ModelBranch(model.config, model.base_model.encoder.block, model.base_model.encoder.final_layer_norm, model.l
